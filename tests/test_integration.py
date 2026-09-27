@@ -56,23 +56,25 @@ async def test_services_registered_without_loaded_entry(hass) -> None:
 async def test_successful_action_refreshes_once(hass, loaded_entry) -> None:
     """A successful write is followed by one coordinator refresh."""
     _entry, client = loaded_entry
+    fetches_before = client.async_fetch_account.await_count
 
     await call_action(hass)
 
     client.async_request_state_change.assert_awaited_once_with({"homeIntervalTime": 10})
-    assert client.async_fetch_account.await_count == 2
+    assert client.async_fetch_account.await_count == fetches_before + 1
 
 
 async def test_failed_action_is_reported_and_not_refreshed(hass, loaded_entry) -> None:
     """A failed cloud write must not look successful to an automation."""
     _entry, client = loaded_entry
     client.async_request_state_change.side_effect = FloLogicError("offline")
+    fetches_before = client.async_fetch_account.await_count
 
     with pytest.raises(HomeAssistantError, match="offline"):
         await call_action(hass)
 
     client.async_request_state_change.assert_awaited_once()
-    assert client.async_fetch_account.await_count == 1
+    assert client.async_fetch_account.await_count == fetches_before
 
 
 @pytest.mark.parametrize(
