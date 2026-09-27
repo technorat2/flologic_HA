@@ -318,8 +318,13 @@ class FloLogicConnection:
     ) -> list[Any]:
         """Invoke a hub method and wait for an event."""
         waiter = self.wait_for(event_name)
-        await self.invoke(target, *arguments)
-        return await asyncio.wait_for(waiter, timeout)
+        try:
+            await self.invoke(target, *arguments)
+            return await asyncio.wait_for(waiter, timeout)
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            self._remove_waiter(event_name, waiter)
 
     def wait_for(self, event_name: str) -> asyncio.Future[list[Any]]:
         """Wait for a hub event."""
@@ -411,6 +416,7 @@ class FloLogicClient:
         self._persistent_devices: list[dict[str, Any]] = []
         self._push_callback: Callable[[FloLogicAccount], None] | None = None
         self._last_account: FloLogicAccount | None = None
+        self._push_revision = 0
         self._reconnect_task: asyncio.Task | None = None
         self._closing = False
 
@@ -485,9 +491,19 @@ class FloLogicClient:
     ) -> FloLogicAccount:
         """Fetch a snapshot using the persistent SignalR connection."""
         user, valve, devices = await self._refresh_persistent_valve(connection)
+        push_revision = self._push_revision
         access = await self._fetch_access(connection, user, valve)
         scheduler = await self._fetch_scheduler(connection, user, valve)
         notifications = await self._fetch_notifications(connection, user, valve)
+        if self._push_revision != push_revision and self._persistent_valve is not None:
+            # Metadata requests yield to the websocket reader. If a newer valve
+            # push arrived while they were in flight, publish that valve state
+            # with the freshly fetched metadata instead of rolling it back.
+            valve = self._persistent_valve
+            devices = list(self._persistent_devices)
+            update_source = "push"
+        else:
+            update_source = "poll"
         return FloLogicAccount(
             user=user,
             valve=valve,
@@ -495,7 +511,7 @@ class FloLogicClient:
             access=access,
             scheduler=scheduler,
             notifications=notifications,
-            update_source="poll",
+            update_source=update_source,
         )
 
     async def _async_send_state_change(
@@ -538,38 +554,46 @@ class FloLogicClient:
         """Log in and return user, selected valve, and device list."""
         login_waiter = connection.wait_for("LoggedIn")
         valve_waiter = connection.wait_for("ValveSent")
-        await connection.invoke(
-            "Login", self._email, self._password, self._device_name, None
-        )
         try:
-            user_args = await asyncio.wait_for(login_waiter, 30)
-        except TimeoutError as err:
-            raise FloLogicAuthError("FloLogic login did not return a user") from err
-        user = user_args[0]
-        self._relog_token = user.get("relogToken") or self._relog_token
-
-        devices: list[dict[str, Any]] = []
-        valve: dict[str, Any] | None = None
-        try:
-            valve_args = await asyncio.wait_for(valve_waiter, 3)
-            valve = valve_args[0]
-            devices = [valve]
-        except TimeoutError:
-            array_args = await connection.invoke_and_wait(
-                "RefreshValveArray",
-                "ValveArraySent",
-                user,
-                timeout=30,
+            await connection.invoke(
+                "Login", self._email, self._password, self._device_name, None
             )
-            devices = array_args[0] if array_args else []
-            valve = choose_valve(devices)
-        finally:
-            if not valve_waiter.done():
-                valve_waiter.cancel()
+            try:
+                user_args = await asyncio.wait_for(login_waiter, 30)
+            except TimeoutError as err:
+                raise FloLogicAuthError("FloLogic login did not return a user") from err
+            if not user_args or not isinstance(user_args[0], dict):
+                raise FloLogicError("FloLogic returned an invalid login payload")
+            user = user_args[0]
+            self._relog_token = user.get("relogToken") or self._relog_token
 
-        if not valve:
-            raise FloLogicTimeoutError("FloLogic login did not return a valve")
-        return user, valve, devices
+            devices: list[dict[str, Any]] = []
+            valve: dict[str, Any] | None = None
+            try:
+                valve_args = await asyncio.wait_for(valve_waiter, 3)
+                if not valve_args or not isinstance(valve_args[0], dict):
+                    raise FloLogicError("FloLogic returned an invalid valve payload")
+                valve = valve_args[0]
+                devices = [valve]
+            except TimeoutError:
+                array_args = await connection.invoke_and_wait(
+                    "RefreshValveArray",
+                    "ValveArraySent",
+                    user,
+                    timeout=30,
+                )
+                devices = _validate_valve_inventory(
+                    array_args[0] if array_args else None
+                )
+                valve = choose_valve(devices)
+
+            if not valve:
+                raise FloLogicTimeoutError("FloLogic login did not return a valve")
+            return user, valve, devices
+        finally:
+            for waiter in (login_waiter, valve_waiter):
+                if not waiter.done():
+                    waiter.cancel()
 
     async def _fetch_access(
         self,
@@ -648,11 +672,14 @@ class FloLogicClient:
         self, func: Callable[[aiohttp.ClientSession], Awaitable[Any]]
     ) -> Any:
         """Run a function with a client session."""
-        if self._session_factory is not None:
-            session = self._session_factory()
-            return await func(session)
-        async with aiohttp.ClientSession() as session:
-            return await func(session)
+        try:
+            if self._session_factory is not None:
+                session = self._session_factory()
+                return await func(session)
+            async with aiohttp.ClientSession() as session:
+                return await func(session)
+        except (TimeoutError, aiohttp.ClientError) as err:
+            raise FloLogicError(f"Unable to communicate with FloLogic: {err}") from err
 
     async def _with_persistent_retry(
         self,
@@ -757,7 +784,7 @@ class FloLogicClient:
             self._persistent_user,
             timeout=30,
         )
-        devices = args[0] if args else []
+        devices = _validate_valve_inventory(args[0] if args else None)
         valve = choose_valve(devices)
         if not valve:
             raise FloLogicTimeoutError("FloLogic refresh did not return a valve")
@@ -773,14 +800,30 @@ class FloLogicClient:
                 self._handle_pushed_valves([valve])
         elif target == "ValveArraySent" and arguments:
             valves = arguments[0]
-            if isinstance(valves, list):
-                self._handle_pushed_valves(
-                    [valve for valve in valves if isinstance(valve, dict)]
+            if not isinstance(valves, list) or any(
+                not isinstance(valve, dict) for valve in valves
+            ):
+                _LOGGER.warning(
+                    "Ignoring malformed FloLogic ValveArraySent payload; retaining "
+                    "the last known valve"
                 )
+                return
+            if not valves:
+                _LOGGER.warning(
+                    "Ignoring empty FloLogic ValveArraySent payload; retaining the "
+                    "last known valve until a poll confirms its state"
+                )
+                return
+            self._handle_pushed_valves(valves)
 
     def _handle_pushed_valves(self, valves: list[dict[str, Any]]) -> None:
         """Update the cached account from pushed valve data."""
         if not self._keep_session_alive or self._persistent_user is None:
+            return
+        if not valves:
+            _LOGGER.warning(
+                "Ignoring empty FloLogic valve push; retaining the last known valve"
+            )
             return
         valve = choose_valve(valves)
         if valve is None:
@@ -795,6 +838,7 @@ class FloLogicClient:
             return
         self._persistent_valve = valve
         self._persistent_devices = valves
+        self._push_revision += 1
         if self._last_account is not None:
             account = FloLogicAccount(
                 user=self._last_account.user,
@@ -839,6 +883,15 @@ class FloLogicClient:
             if self._keep_session_alive
             else None,
         )
+
+
+def _validate_valve_inventory(payload: Any) -> list[dict[str, Any]]:
+    """Validate a solicited valve-array response without changing cached state."""
+    if not isinstance(payload, list) or any(
+        not isinstance(device, dict) for device in payload
+    ):
+        raise FloLogicError("FloLogic returned an invalid valve inventory")
+    return payload
 
 
 def choose_valve(devices: list[dict[str, Any]]) -> dict[str, Any] | None:

@@ -112,6 +112,10 @@ The integration registers these service actions under the `flologic` domain:
 - `flologic.set_pre_alert_notice`
 - `flologic.set_no_flow_notice`
 
+Service inputs are validated before a cloud command is sent. Invalid values are
+rejected, and cloud command failures are reported to the calling automation
+instead of appearing successful.
+
 ## Advance Shutoff Warning
 
 FloLogic can notify users before continuous flow reaches the automatic shutoff limit. This integration exposes that behavior with:
@@ -139,3 +143,11 @@ The estimate uses FloLogic valve state, flow state, `lastNewFlow`, mode-specific
 Open issues at:
 
 https://github.com/technorat2/flologic_HA/issues
+
+## Development
+
+Tests use Home Assistant's integration harness with mocked FloLogic cloud
+connections; they never send commands to a live valve. Install
+`requirements_test.txt` in a Python 3.14 virtual environment and run
+`python -m pytest -q`. CI also runs Ruff, formatting, Python compilation, and
+JSON validation.

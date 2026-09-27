@@ -5,6 +5,7 @@ set_flow_sensitivity:
       selector:
         number:
           min: 0
+          max: 1000
           mode: box
           step: 0.1
 set_home_limit:
@@ -14,6 +15,7 @@ set_home_limit:
       selector:
         number:
           min: 0
+          max: 10080
           mode: box
           step: 1
 set_away_limit:
@@ -23,6 +25,7 @@ set_away_limit:
       selector:
         number:
           min: 0
+          max: 10080
           mode: box
           step: 0.5
 set_bypass_time:
@@ -32,6 +35,7 @@ set_bypass_time:
       selector:
         number:
           min: 0
+          max: 10080
           mode: box
           step: 1
 set_auto_away:
@@ -41,6 +45,7 @@ set_auto_away:
       selector:
         number:
           min: 0
+          max: 8760
           mode: box
           step: 1
 set_temp_alert:
@@ -49,6 +54,8 @@ set_temp_alert:
       required: true
       selector:
         number:
+          min: -50
+          max: 150
           mode: box
           step: 1
 set_temp_shutoff:
@@ -57,6 +64,8 @@ set_temp_shutoff:
       required: true
       selector:
         number:
+          min: -50
+          max: 150
           mode: box
           step: 1
 set_pre_alert_notice:
@@ -66,6 +75,7 @@ set_pre_alert_notice:
       selector:
         number:
           min: 0
+          max: 10080
           mode: box
           step: 1
 set_no_flow_notice:
@@ -75,5 +85,6 @@ set_no_flow_notice:
       selector:
         number:
           min: 0
+          max: 604800
           mode: box
           step: 1

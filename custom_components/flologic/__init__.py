@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
+from aiohttp import ClientError
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.typing import ConfigType
 
 from .api import FloLogicClient
 from .const import (
@@ -37,6 +41,7 @@ from .const import (
 )
 from .coordinator import FloLogicCoordinator
 from .device_identity import build_device_identity
+from .exceptions import FloLogicError
 
 SERVICE_SET_FLOW_SENSITIVITY = "set_flow_sensitivity"
 SERVICE_SET_HOME_LIMIT = "set_home_limit"
@@ -70,25 +75,51 @@ HIDDEN_BY_DEFAULT_UNIQUE_ID_SUFFIXES = {
     "signal_strength",
 }
 
+_LOGGER = logging.getLogger(__name__)
+
+# These deliberately generous bounds catch unit mistakes and obviously invalid
+# writes without claiming to model undocumented cloud-side limits exactly.
+_MAX_MINUTES = 10080  # one week
+_MAX_HOURS = 8760  # one year
+_MAX_SECONDS = 604800  # one week
+_MAX_FLOW_SENSITIVITY = 1000.0  # oz/min
+_MIN_TEMPERATURE_F = -50
+_MAX_TEMPERATURE_F = 150
+
+_MINUTES = vol.All(cv.positive_int, vol.Range(max=_MAX_MINUTES))
+_MINUTES_FLOAT = vol.All(vol.Coerce(float), vol.Range(min=0, max=_MAX_MINUTES))
+_HOURS = vol.All(cv.positive_int, vol.Range(max=_MAX_HOURS))
+_SECONDS = vol.All(cv.positive_int, vol.Range(max=_MAX_SECONDS))
+_TEMPERATURE_F = vol.All(
+    vol.Coerce(int), vol.Range(min=_MIN_TEMPERATURE_F, max=_MAX_TEMPERATURE_F)
+)
+_FLOW_SENSITIVITY = vol.All(
+    vol.Coerce(float), vol.Range(min=0, max=_MAX_FLOW_SENSITIVITY)
+)
+
 WRITE_SERVICE_SCHEMAS = {
     SERVICE_SET_FLOW_SENSITIVITY: vol.Schema(
-        {vol.Required(ATTR_VALUE): vol.Coerce(float)}
+        {vol.Required(ATTR_VALUE): _FLOW_SENSITIVITY}
     ),
-    SERVICE_SET_HOME_LIMIT: vol.Schema({vol.Required(ATTR_MINUTES): cv.positive_int}),
-    SERVICE_SET_AWAY_LIMIT: vol.Schema({vol.Required(ATTR_MINUTES): vol.Coerce(float)}),
-    SERVICE_SET_BYPASS_TIME: vol.Schema({vol.Required(ATTR_MINUTES): cv.positive_int}),
-    SERVICE_SET_AUTO_AWAY: vol.Schema({vol.Required(ATTR_HOURS): cv.positive_int}),
+    SERVICE_SET_HOME_LIMIT: vol.Schema({vol.Required(ATTR_MINUTES): _MINUTES}),
+    SERVICE_SET_AWAY_LIMIT: vol.Schema({vol.Required(ATTR_MINUTES): _MINUTES_FLOAT}),
+    SERVICE_SET_BYPASS_TIME: vol.Schema({vol.Required(ATTR_MINUTES): _MINUTES}),
+    SERVICE_SET_AUTO_AWAY: vol.Schema({vol.Required(ATTR_HOURS): _HOURS}),
     SERVICE_SET_TEMP_ALERT: vol.Schema(
-        {vol.Required(ATTR_TEMPERATURE): vol.Coerce(int)}
+        {vol.Required(ATTR_TEMPERATURE): _TEMPERATURE_F}
     ),
     SERVICE_SET_TEMP_SHUTOFF: vol.Schema(
-        {vol.Required(ATTR_TEMPERATURE): vol.Coerce(int)}
+        {vol.Required(ATTR_TEMPERATURE): _TEMPERATURE_F}
     ),
-    SERVICE_SET_PRE_ALERT: vol.Schema({vol.Required(ATTR_MINUTES): cv.positive_int}),
-    SERVICE_SET_NO_FLOW_NOTICE: vol.Schema(
-        {vol.Required(ATTR_SECONDS): cv.positive_int}
-    ),
+    SERVICE_SET_PRE_ALERT: vol.Schema({vol.Required(ATTR_MINUTES): _MINUTES}),
+    SERVICE_SET_NO_FLOW_NOTICE: vol.Schema({vol.Required(ATTR_SECONDS): _SECONDS}),
 }
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register actions before a config entry is loaded."""
+    _async_register_services(hass)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -120,6 +151,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _async_migrate_hidden_entity_defaults(hass, entry, coordinator)
 
+    # Remain defensive for direct setup-entry tests and unusual loaders.
     _async_register_services(hass)
     return True
 
@@ -217,7 +249,12 @@ def _async_register_services(hass: HomeAssistant) -> None:
     async def handle_service(call: ServiceCall) -> None:
         coordinator = _get_first_coordinator(hass)
         fields = _service_call_to_command(call)
-        await coordinator.client.async_request_state_change(fields)
+        try:
+            await coordinator.client.async_request_state_change(fields)
+        except (FloLogicError, TimeoutError, ClientError) as err:
+            message = f"FloLogic action {call.service} failed: {err}"
+            _LOGGER.error("%s", message)
+            raise HomeAssistantError(message) from err
         await coordinator.async_request_refresh()
 
     for service, schema in WRITE_SERVICE_SCHEMAS.items():
@@ -231,7 +268,7 @@ def _get_first_coordinator(hass: HomeAssistant) -> FloLogicCoordinator:
     for key, value in hass.data.get(DOMAIN, {}).items():
         if key != "_services_registered":
             return value
-    raise RuntimeError("No FloLogic config entry is loaded")
+    raise ServiceValidationError("No FloLogic config entry is loaded")
 
 
 def _service_call_to_command(call: ServiceCall) -> dict[str, Any]:
@@ -255,4 +292,4 @@ def _service_call_to_command(call: ServiceCall) -> dict[str, Any]:
         return {"preAlertNoticeInterval": data[ATTR_MINUTES]}
     if call.service == SERVICE_SET_NO_FLOW_NOTICE:
         return {"noFlowNoticeInterval": data[ATTR_SECONDS]}
-    raise RuntimeError(f"Unsupported FloLogic service: {call.service}")
+    raise ServiceValidationError(f"Unsupported FloLogic service: {call.service}")
