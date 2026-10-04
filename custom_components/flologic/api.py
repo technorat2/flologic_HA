@@ -582,9 +582,7 @@ class FloLogicClient:
                     user,
                     timeout=30,
                 )
-                devices = _validate_valve_inventory(
-                    array_args[0] if array_args else None
-                )
+                devices = array_args[0] if array_args else []
                 valve = choose_valve(devices)
 
             if not valve:
@@ -784,7 +782,7 @@ class FloLogicClient:
             self._persistent_user,
             timeout=30,
         )
-        devices = _validate_valve_inventory(args[0] if args else None)
+        devices = args[0] if args else []
         valve = choose_valve(devices)
         if not valve:
             raise FloLogicTimeoutError("FloLogic refresh did not return a valve")
@@ -800,21 +798,10 @@ class FloLogicClient:
                 self._handle_pushed_valves([valve])
         elif target == "ValveArraySent" and arguments:
             valves = arguments[0]
-            if not isinstance(valves, list) or any(
-                not isinstance(valve, dict) for valve in valves
-            ):
-                _LOGGER.warning(
-                    "Ignoring malformed FloLogic ValveArraySent payload; retaining "
-                    "the last known valve"
+            if isinstance(valves, list):
+                self._handle_pushed_valves(
+                    [valve for valve in valves if isinstance(valve, dict)]
                 )
-                return
-            if not valves:
-                _LOGGER.warning(
-                    "Ignoring empty FloLogic ValveArraySent payload; retaining the "
-                    "last known valve until a poll confirms its state"
-                )
-                return
-            self._handle_pushed_valves(valves)
 
     def _handle_pushed_valves(self, valves: list[dict[str, Any]]) -> None:
         """Update the cached account from pushed valve data."""
@@ -883,15 +870,6 @@ class FloLogicClient:
             if self._keep_session_alive
             else None,
         )
-
-
-def _validate_valve_inventory(payload: Any) -> list[dict[str, Any]]:
-    """Validate a solicited valve-array response without changing cached state."""
-    if not isinstance(payload, list) or any(
-        not isinstance(device, dict) for device in payload
-    ):
-        raise FloLogicError("FloLogic returned an invalid valve inventory")
-    return payload
 
 
 def choose_valve(devices: list[dict[str, Any]]) -> dict[str, Any] | None:

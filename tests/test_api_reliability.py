@@ -139,23 +139,25 @@ async def test_push_during_poll_preserves_latest_valve_state() -> None:
     assert account.update_source == "push"
 
 
-@pytest.mark.parametrize("payload", [None, ["invalid"], [{"id": 11}, "invalid"]])
-async def test_malformed_inventory_preserves_cached_valve(payload: Any) -> None:
-    """Malformed solicited inventories fail without replacing cached state."""
+async def test_mixed_inventory_uses_valid_valve() -> None:
+    """A usable valve is accepted even when extra inventory entries are malformed."""
     client = make_client()
     valve = make_valve()
     client._persistent_user = {"id": 7}
     client._persistent_valve = valve
     client._persistent_devices = [valve]
+    payload = [valve, "invalid"]
     connection = SimpleNamespace(
         invoke_and_wait=AsyncMock(return_value=[payload]),
     )
 
-    with pytest.raises(FloLogicError, match="invalid valve inventory"):
-        await client._refresh_persistent_valve(connection)
+    user, selected, devices = await client._refresh_persistent_valve(connection)
 
-    assert client._persistent_valve == valve
-    assert client._persistent_devices == [valve]
+    assert user == {"id": 7}
+    assert selected == valve
+    assert devices == payload
+    assert client._persistent_valve == selected
+    assert client._persistent_devices == payload
 
 
 async def test_empty_inventory_fails_poll_without_clearing_cache() -> None:
@@ -174,8 +176,8 @@ async def test_empty_inventory_fails_poll_without_clearing_cache() -> None:
     assert client._persistent_devices == [valve]
 
 
-def test_empty_push_is_logged_and_ignored(caplog: pytest.LogCaptureFixture) -> None:
-    """One unsolicited empty array is diagnostic, not authoritative removal."""
+def test_empty_push_is_ignored() -> None:
+    """One unsolicited empty array does not replace the cached valve."""
     client = make_client()
     valve = make_valve()
     client._persistent_user = {"id": 7}
@@ -190,7 +192,24 @@ def test_empty_push_is_logged_and_ignored(caplog: pytest.LogCaptureFixture) -> N
     assert received == []
     assert client._persistent_valve == valve
     assert client._persistent_devices == [valve]
-    assert "Ignoring empty FloLogic ValveArraySent" in caplog.text
+
+
+def test_mixed_push_filters_invalid_entries() -> None:
+    """Unsolicited arrays retain usable valves and discard malformed entries."""
+    client = make_client()
+    valve = make_valve(mode=2)
+    client._persistent_user = {"id": 7}
+    client._persistent_valve = make_valve()
+    client._persistent_devices = [client._persistent_valve]
+    client._last_account = make_account(client._persistent_valve)
+    received: list[FloLogicAccount] = []
+    client.set_push_callback(received.append)
+
+    client._handle_persistent_event("ValveArraySent", [[valve, "invalid"]])
+
+    assert client._persistent_valve == valve
+    assert client._persistent_devices == [valve]
+    assert received[-1].valve == valve
 
 
 @pytest.mark.parametrize(
